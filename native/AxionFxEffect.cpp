@@ -24,6 +24,7 @@
 #include <android-base/logging.h>
 #include <fmq/AidlMessageQueue.h>
 #include <system/audio_effects/effect_uuid.h>
+#include <system/audio_effect.h>
 
 #include "AxionFxEffect.h"
 #include "AxionFxParams.h"
@@ -83,56 +84,98 @@ AxionFxContext::AxionFxContext(int statusDepth, const Parameter::Common& common)
     mEngine.configure(common.input.base.sampleRate);
 }
 
+// Vendor AIDL effect parameters arrive as a legacy effect_param_t blob inside
+// DefaultExtension.bytes, not as raw AxionFxParam bytes. Keep set/get parsing
+// in sync with AudioEffect EFFECT_CMD_SET/GET_PARAM wire format.
 RetCode AxionFxContext::setParams(const std::vector<uint8_t>& params) {
-    if (params.size() < sizeof(int32_t)) {
+    if (params.size() < sizeof(effect_param_t)) {
         LOG(ERROR) << "setParams: too small " << params.size();
         return RetCode::ERROR_ILLEGAL_PARAMETER;
     }
 
-    int32_t paramId = *reinterpret_cast<const int32_t*>(params.data());
+    const auto* ep = reinterpret_cast<const effect_param_t*>(params.data());
+
+    if (ep->psize < sizeof(int32_t)) {
+        LOG(ERROR) << "setParams: bad psize " << ep->psize;
+        return RetCode::ERROR_ILLEGAL_PARAMETER;
+    }
+
+    const uint32_t valueOffset = (ep->psize + 3) & ~3;
+    const size_t needed = sizeof(effect_param_t) + valueOffset + ep->vsize;
+    if (params.size() < needed) {
+        LOG(ERROR) << "setParams: truncated buffer size=" << params.size()
+                    << " needed=" << needed;
+        return RetCode::ERROR_ILLEGAL_PARAMETER;
+    }
+
+    int32_t paramId = 0;
+    std::memcpy(&paramId, ep->data, sizeof(paramId));
+
+    const uint8_t* valuePtr =
+        reinterpret_cast<const uint8_t*>(ep->data) + valueOffset;
 
     if (paramId == axionfx::PARAM_CONVOLVER_LOAD_IR) {
-        if (params.size() > sizeof(int32_t)) {
-            const char* pathData = reinterpret_cast<const char*>(params.data() + sizeof(int32_t));
-            size_t pathLen = params.size() - sizeof(int32_t);
-            std::string path(pathData, strnlen(pathData, pathLen));
-            mEngine.loadIrFromPath(path.c_str());
-        }
+        std::string path(reinterpret_cast<const char*>(valuePtr),
+                         strnlen(reinterpret_cast<const char*>(valuePtr), ep->vsize));
+        mEngine.loadIrFromPath(path.c_str());
         mLastParams = params;
         return RetCode::SUCCESS;
     }
 
     if (paramId == axionfx::PARAM_CONVOLVER_LOAD_IR_DATA) {
-        if (params.size() > sizeof(int32_t)) {
-            const uint8_t* wavData = params.data() + sizeof(int32_t);
-            size_t wavSize = params.size() - sizeof(int32_t);
-            mEngine.loadIrFromData(wavData, wavSize);
-        }
+        mEngine.loadIrFromData(valuePtr, ep->vsize);
         mLastParams = params;
         return RetCode::SUCCESS;
     }
 
-    if (params.size() < sizeof(axionfx::AxionFxParam)) {
-        LOG(ERROR) << "setParams: too small " << params.size();
+    if (ep->vsize < sizeof(int32_t)) {
+        LOG(ERROR) << "setParams: vsize too small " << ep->vsize;
         return RetCode::ERROR_ILLEGAL_PARAMETER;
     }
 
-    const auto* param = reinterpret_cast<const axionfx::AxionFxParam*>(params.data());
-    LOG(INFO) << "setParams paramId=" << param->paramId << " value=" << param->value;
-    mEngine.setParameter(param->paramId, param->value);
+    int32_t value = 0;
+    std::memcpy(&value, valuePtr, sizeof(value));
+    LOG(INFO) << "setParams paramId=0x" << std::hex << paramId
+              << " value=" << std::dec << value;
+
+    mEngine.setParameter(paramId, value);
     mLastParams = params;
     return RetCode::SUCCESS;
 }
 
 std::vector<uint8_t> AxionFxContext::getParams(const std::vector<uint8_t>& id) const {
-    if (id.size() >= sizeof(int32_t)) {
-        int32_t paramId = *reinterpret_cast<const int32_t*>(id.data());
-        int32_t value = mEngine.getParameter(paramId);
-        axionfx::AxionFxParam result = {paramId, value};
-        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&result);
-        return std::vector<uint8_t>(ptr, ptr + sizeof(result));
+    if (id.size() < sizeof(effect_param_t)) {
+        return mLastParams;
     }
-    return mLastParams;
+
+    const auto* req = reinterpret_cast<const effect_param_t*>(id.data());
+
+    if (req->psize < sizeof(int32_t)) {
+        return mLastParams;
+    }
+
+    const uint32_t reqParamPaddedSize = (req->psize + 3) & ~3;
+    const size_t reqNeeded = sizeof(effect_param_t) + reqParamPaddedSize;
+    if (id.size() < reqNeeded) {
+        return mLastParams;
+    }
+
+    int32_t paramId = 0;
+    std::memcpy(&paramId, req->data, sizeof(paramId));
+
+    int32_t value = mEngine.getParameter(paramId);
+
+    std::vector<uint8_t> out(sizeof(effect_param_t) + 8);
+    auto* reply = reinterpret_cast<effect_param_t*>(out.data());
+    reply->status = 0;
+    reply->psize = sizeof(int32_t);
+    reply->vsize = sizeof(int32_t);
+    std::memcpy(reply->data, &paramId, sizeof(paramId));
+
+    const uint32_t valueOffset = (reply->psize + 3) & ~3;
+    std::memcpy(reply->data + valueOffset, &value, sizeof(value));
+
+    return out;
 }
 
 AxionFxEffect::~AxionFxEffect() {
